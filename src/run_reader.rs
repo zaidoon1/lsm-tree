@@ -27,7 +27,7 @@ impl RunReader {
     ) -> Option<Self> {
         assert!(!run.is_empty(), "level reader cannot read empty level");
 
-        let (lo, hi) = run.range_indexes(&range)?;
+        let (lo, hi) = run.range_overlap_indexes(&range)?;
 
         // Early optimization: Skip prefix filter checks if no prefix extractor is configured
         // Check the first segment to see if any segments have a prefix extractor
