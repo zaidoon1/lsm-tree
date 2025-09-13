@@ -272,7 +272,7 @@ impl Segment {
                 &IndexBlock::new(self.load_block(
                     &self.regions.tli,
                     BlockType::Index,
-                    self.metadata.data_block_compression, // TODO: maybe index compression
+                    CompressionType::None, // TODO: allow index block compression
                 )?)
             }
         };
@@ -523,7 +523,7 @@ impl Segment {
                     self.load_block(
                         &self.regions.tli,
                         BlockType::Index,
-                        self.metadata.data_block_compression, // TODO: maybe index compression
+                        CompressionType::None, // TODO: allow separate index block compression
                     )
                     .expect("should load block"),
                 )
@@ -640,8 +640,8 @@ impl Segment {
                 let block = Block::from_file(
                     &file,
                     regions.tli,
-                    crate::segment::block::BlockType::Index,
-                    metadata.data_block_compression, // TODO: index blocks may get their own compression level
+                    BlockType::Index,
+                    CompressionType::None, // TODO: allow setting index block compression
                 )?;
 
                 IndexBlock::new(block)
@@ -669,7 +669,7 @@ impl Segment {
                     Block::from_file(
                         &file,
                         filter_handle,
-                        crate::segment::block::BlockType::Filter,
+                        BlockType::Filter,
                         crate::CompressionType::None, // NOTE: We never write a filter block with compression
                     )
                 })
