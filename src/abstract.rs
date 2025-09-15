@@ -50,6 +50,18 @@ pub trait AbstractTree {
         index: Option<Arc<Memtable>>,
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl<'_>> + '_>;
 
+    /// Checks whether there exists at least one key in the tree that starts with the given prefix.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs while checking storage.
+    fn contains_prefix<K: AsRef<[u8]>>(
+        &self,
+        prefix: K,
+        seqno: SeqNo,
+        index: Option<Arc<Memtable>>,
+    ) -> crate::Result<bool>;
+
     /// Ingests a sorted stream of key-value pairs into the tree.
     ///
     /// Can only be called on a new fresh, empty tree.

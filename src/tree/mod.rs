@@ -24,7 +24,7 @@ use crate::{
 use inner::{MemtableId, SealedMemtables, TreeId, TreeInner};
 use std::{
     io::Cursor,
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     path::Path,
     sync::{atomic::AtomicU64, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -204,6 +204,168 @@ impl AbstractTree for Tree {
             .iter_segments()
             .map(Segment::pinned_block_index_size)
             .sum()
+    }
+
+    fn contains_prefix<K: AsRef<[u8]>>(
+        &self,
+        prefix: K,
+        seqno: SeqNo,
+        index: Option<Arc<Memtable>>,
+    ) -> crate::Result<bool> {
+        use crate::key::InternalKey;
+        use crate::range::prefix_to_range;
+        use crate::run_reader::RunReader;
+        use crate::segment::CachePolicy;
+        use crate::value::ValueType;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        // Compute user-level range bounds for the prefix
+        let prefix_bytes = prefix.as_ref();
+        let is_empty_prefix = prefix_bytes.is_empty();
+        let user_bounds = prefix_to_range(prefix_bytes);
+
+        // Lazily build &[u8]-based bounds only when needed by the prefilter
+        let build_slice_bounds = || -> (Bound<&[u8]>, Bound<&[u8]>) {
+            let lo = match &user_bounds.0 {
+                Included(k) => Included(&k[..]),
+                Excluded(k) => Excluded(&k[..]),
+                Unbounded => Unbounded,
+            };
+            let hi = match &user_bounds.1 {
+                Included(k) => Included(&k[..]),
+                Excluded(k) => Excluded(&k[..]),
+                Unbounded => Unbounded,
+            };
+            (lo, hi)
+        };
+
+        // Helper: map user bounds to InternalKey bounds for memtable scans
+        let to_internal_bounds = |bounds: &(Bound<UserKey>, Bound<UserKey>)| {
+            let lo = match &bounds.0 {
+                Included(k) => Included(InternalKey::new(
+                    (*k).clone(),
+                    SeqNo::MAX,
+                    ValueType::Tombstone,
+                )),
+                Excluded(k) => Excluded(InternalKey::new((*k).clone(), 0, ValueType::Tombstone)),
+                Unbounded => Unbounded,
+            };
+
+            let hi = match &bounds.1 {
+                Included(k) => Included(InternalKey::new((*k).clone(), 0, ValueType::Value)),
+                Excluded(k) => {
+                    Excluded(InternalKey::new((*k).clone(), SeqNo::MAX, ValueType::Value))
+                }
+                Unbounded => Unbounded,
+            };
+
+            (lo, hi)
+        };
+
+        // Precompute memtable bounds to avoid recomputation
+        let mem_ik_bounds = to_internal_bounds(&user_bounds);
+
+        // Helper: scan a memtable for any visible value in-range
+        let memtable_has_prefix = |mt: &Memtable| -> bool {
+            for item in mt.range(mem_ik_bounds.clone()) {
+                if item.key.seqno < seqno && !item.is_tombstone() {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // 1) Ephemeral overlay (if any)
+        if let Some(ephemeral) = &index {
+            if memtable_has_prefix(ephemeral) {
+                return Ok(true);
+            }
+        }
+        // 2) Active memtable
+        {
+            let active = self.active_memtable.read().expect("lock is poisoned");
+            if memtable_has_prefix(&active) {
+                return Ok(true);
+            }
+        }
+        // 3) Sealed memtables (most-recent first)
+        {
+            let sealed = self.sealed_memtables.read().expect("lock is poisoned");
+            for (_, mt) in sealed.iter().rev() {
+                if memtable_has_prefix(mt) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Aggressive upfront prefilter across all segments and runs.
+        // If no segment could possibly contain any key in range (by key-range and bloom), return early.
+        // IMPORTANT: Do NOT apply this when the prefix is empty, since empty prefix matches all keys
+        // and bloom filters may be out-of-domain.
+        if !is_empty_prefix {
+            let slice_bounds = build_slice_bounds();
+            let manifest = self.manifest.read().expect("lock is poisoned");
+            let mut any_match = false;
+            'outer: for level in manifest.current_version().iter_levels() {
+                for run in level.iter() {
+                    for segment in run.iter() {
+                        if segment.check_key_range_overlap(&slice_bounds)
+                            && segment.might_contain_range(&user_bounds)
+                        {
+                            any_match = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if !any_match {
+                return Ok(false);
+            }
+        }
+
+        // 4) Disk segments, scanned by run from newest to oldest
+        let manifest = self.manifest.read().expect("lock is poisoned");
+
+        // Tombstone guard set to prune older values of the same key
+        let mut tombstoned: crate::HashSet<UserKey> = crate::HashSet::default();
+
+        for run in manifest
+            .current_version()
+            .iter_levels()
+            .flat_map(|lvl| lvl.iter())
+        {
+            if let Some(reader) =
+                RunReader::new(run.clone(), user_bounds.clone(), CachePolicy::Read)
+            {
+                for item_res in reader {
+                    let item = match item_res {
+                        Ok(x) => x,
+                        Err(e) => return Err(e),
+                    };
+
+                    if item.key.seqno >= seqno {
+                        continue;
+                    }
+
+                    if item.is_tombstone() {
+                        tombstoned.insert(item.key.user_key.clone());
+                        continue;
+                    }
+
+                    if tombstoned.contains(&item.key.user_key) {
+                        continue;
+                    }
+
+                    let user_key: &[u8] = &*item.key.user_key;
+
+                    if self.get(user_key, seqno)?.is_some() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     fn sealed_memtable_count(&self) -> usize {

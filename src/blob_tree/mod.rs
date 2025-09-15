@@ -292,6 +292,16 @@ impl AbstractTree for BlobTree {
         )
     }
 
+    fn contains_prefix<K: AsRef<[u8]>>(
+        &self,
+        prefix: K,
+        seqno: SeqNo,
+        index: Option<Arc<Memtable>>,
+    ) -> crate::Result<bool> {
+        // Delegate to index tree; this avoids any value log access.
+        self.index.contains_prefix(prefix, seqno, index)
+    }
+
     fn tombstone_count(&self) -> u64 {
         self.index.tombstone_count()
     }
