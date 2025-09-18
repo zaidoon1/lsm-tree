@@ -25,9 +25,6 @@ pub use index_block::{BlockHandle, IndexBlock, KeyedBlockHandle};
 pub use scanner::Scanner;
 pub use writer::Writer;
 
-#[cfg(feature = "metrics")]
-use crate::metrics::Metrics;
-
 use crate::{
     cache::Cache,
     descriptor_table::DescriptorTable,
@@ -44,6 +41,9 @@ use std::{
     sync::Arc,
 };
 use util::load_block;
+
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
 
 // TODO: segment iter:
 // TODO:    we only need to truncate items from blocks that are not the first and last block
