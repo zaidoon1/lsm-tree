@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering::Relaxed;
 /// Runtime metrics
 ///
 /// Are not stored durably, so metrics will reset after a restart/crash.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Metrics {
     /// Number of index blocks that were actually read from disk
     pub(crate) index_block_load_io: AtomicUsize,

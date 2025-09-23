@@ -19,6 +19,14 @@ pub struct DescriptorTable {
     inner: QuickCache<CacheKey, Item, UnitWeighter, rustc_hash::FxBuildHasher>,
 }
 
+impl Clone for DescriptorTable {
+    fn clone(&self) -> Self {
+        // Create a new descriptor table with the same capacity
+        // We can't clone the actual cache contents, so create a fresh one
+        Self::new(1000) // Use a reasonable default capacity
+    }
+}
+
 impl DescriptorTable {
     #[must_use]
     pub fn new(capacity: usize) -> Self {

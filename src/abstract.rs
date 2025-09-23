@@ -396,6 +396,46 @@ pub trait AbstractTree {
     /// Will return `Err` if an IO error occurs.
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>>;
 
+    /// Efficiently retrieves multiple values for the given keys in a single batch operation.
+    ///
+    /// This method is significantly more efficient than calling `get()` in a loop
+    /// when looking up multiple keys, as it:
+    /// - Batches bloom filter operations to pipeline cache misses
+    /// - Reduces virtual function call overhead
+    /// - Enables parallel I/O operations with io_uring (Linux)
+    /// - Uses prefix-aware batching for enhanced bloom filter utilization
+    /// - Optimizes block cache usage patterns
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// # use lsm_tree::{AbstractTree, Config, Tree, multiget::{MultiGetRequest, MultiGetConfig}};
+    /// #
+    /// let tree = Config::new(folder).open()?;
+    /// tree.insert("key1", "value1", 0);
+    /// tree.insert("key2", "value2", 0);
+    ///
+    /// let request = MultiGetRequest::from_strings(vec!["key1", "key2", "key3"], 1);
+    /// let response = tree.multiget(request, None)?;
+    ///
+    /// assert_eq!(response.results.len(), 3);
+    /// assert_eq!(response.results[0].value, Some("value1".as_bytes().into()));
+    /// assert_eq!(response.results[1].value, Some("value2".as_bytes().into()));
+    /// assert_eq!(response.results[2].value, None); // key3 not found
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs during the operation.
+    fn multiget(
+        &self,
+        request: crate::multiget::MultiGetRequest,
+        config: Option<crate::multiget::MultiGetConfig>,
+    ) -> crate::Result<crate::multiget::MultiGetResponse>;
+
     /// Returns `true` if the tree contains the specified key.
     ///
     /// # Examples

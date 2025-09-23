@@ -28,7 +28,7 @@ use std::fs::File;
 /// A block on disk
 ///
 /// Consists of a fixed-size header and some bytes (the data/payload).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Block {
     pub header: Header,
     pub data: Slice,

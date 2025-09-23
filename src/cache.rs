@@ -79,6 +79,13 @@ pub struct Cache {
     capacity: u64,
 }
 
+impl Clone for Cache {
+    fn clone(&self) -> Self {
+        // Create a new cache with the same capacity
+        Self::with_capacity_bytes(self.capacity)
+    }
+}
+
 impl Cache {
     /// Creates a new block cache with roughly `n` bytes of capacity.
     #[must_use]

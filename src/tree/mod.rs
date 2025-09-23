@@ -49,7 +49,7 @@ impl IterGuard for Guard {
     }
 }
 
-fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
+pub(crate) fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
     if item.is_tombstone() {
         None
     } else {
@@ -508,6 +508,14 @@ impl AbstractTree for Tree {
         let value = InternalValue::new_weak_tombstone(key, seqno);
         self.append_entry(value)
     }
+
+    fn multiget(
+        &self,
+        request: crate::multiget::MultiGetRequest,
+        config: Option<crate::multiget::MultiGetConfig>,
+    ) -> crate::Result<crate::multiget::MultiGetResponse> {
+        self.multiget_internal(request, config)
+    }
 }
 
 impl Tree {
@@ -716,6 +724,491 @@ impl Tree {
         }
 
         Ok(None)
+    }
+
+    /// Efficiently retrieves multiple values in a single batch operation
+    fn multiget_internal(
+        &self,
+        request: crate::multiget::MultiGetRequest,
+        config: Option<crate::multiget::MultiGetConfig>,
+    ) -> crate::Result<crate::multiget::MultiGetResponse> {
+        use crate::multiget::MultiGetContext;
+
+        let config = config.unwrap_or_default();
+        let mut context = MultiGetContext::new(request);
+
+        // Step 1: Check active memtable
+        self.multiget_from_active_memtable(&mut context)?;
+        if context.is_complete() {
+            return Ok(context.into_response());
+        }
+
+        // Step 2: Check sealed memtables
+        self.multiget_from_sealed_memtables(&mut context)?;
+        if context.is_complete() {
+            return Ok(context.into_response());
+        }
+
+        // Step 3: Check segments with advanced optimizations
+        if config.enable_parallel_io && config.use_io_uring {
+            // Use async I/O with prefix-aware batching for maximum performance
+            self.multiget_from_segments_async(&mut context, &config)?;
+        } else if self.config.prefix_extractor.is_some() {
+            // Use prefix-aware batching with synchronous I/O
+            self.multiget_from_segments_prefix_optimized(&mut context, &config)?;
+        } else {
+            // Use standard bloom filter batching
+            self.multiget_from_segments(&mut context, &config)?;
+        }
+
+        Ok(context.into_response())
+    }
+
+    /// Check active memtable for all remaining keys
+    fn multiget_from_active_memtable(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+    ) -> crate::Result<()> {
+        let memtable_lock = self.active_memtable.read().expect("lock is poisoned");
+
+        // Process all remaining keys
+        let remaining_keys = context.remaining_keys.clone();
+        for key_with_index in &remaining_keys {
+            if let Some(entry) = memtable_lock.get(&key_with_index.key, context.request.seqno) {
+                if let Some(entry) = ignore_tombstone_value(entry) {
+                    context.mark_found(key_with_index.index, entry.value);
+                }
+            }
+        }
+
+        drop(memtable_lock);
+        Ok(())
+    }
+
+    /// Check sealed memtables for all remaining keys
+    fn multiget_from_sealed_memtables(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+    ) -> crate::Result<()> {
+        let sealed_memtables = self.sealed_memtables.read().expect("lock is poisoned");
+
+        for key_with_index in &context.remaining_keys.clone() {
+            for (_, memtable) in sealed_memtables.iter().rev() {
+                if let Some(entry) = memtable.get(&key_with_index.key, context.request.seqno) {
+                    if let Some(entry) = ignore_tombstone_value(entry) {
+                        context.mark_found(key_with_index.index, entry.value);
+                        break; // Found in this memtable, no need to check older ones
+                    }
+                }
+            }
+        }
+
+        drop(sealed_memtables);
+        Ok(())
+    }
+
+    /// Check segments with bloom filter batching and parallel I/O optimizations
+    fn multiget_from_segments(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+        _config: &crate::multiget::MultiGetConfig,
+    ) -> crate::Result<()> {
+        let manifest = self.manifest.read().expect("lock is poisoned");
+
+        // Process level by level (following LSM-tree search order)
+        for level in manifest.current_version().iter_levels() {
+            if context.is_complete() {
+                break;
+            }
+
+            for run in level.iter() {
+                if context.is_complete() {
+                    break;
+                }
+
+                // Group keys by segments they might be in
+                let segment_batches = self.create_segment_batches(run, &context.remaining_keys);
+
+                // Process each segment batch with optimizations
+                for batch in segment_batches {
+                    if let Some(segment) = run.iter().find(|s| s.id() == batch.segment_id) {
+                        self.multiget_from_segment(segment, &batch, context)?;
+                    }
+                }
+            }
+        }
+
+        drop(manifest);
+        Ok(())
+    }
+
+    /// Advanced multiget with async I/O and prefix-aware batching
+    #[cfg(feature = "multiget_advanced")]
+    fn multiget_from_segments_async(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+        config: &crate::multiget::MultiGetConfig,
+    ) -> crate::Result<()> {
+        use crate::multiget::{AsyncIoScheduler, PrefixBatchOrganizer};
+
+        // Get prefix extractor from tree config
+        let prefix_extractor = self.config.prefix_extractor.clone();
+
+        // Organize keys by prefix for better bloom filter utilization
+        let mut prefix_organizer = PrefixBatchOrganizer::new(prefix_extractor);
+        prefix_organizer.add_keys(context.remaining_keys.clone());
+        let prefix_batches = prefix_organizer.into_batches();
+
+        let manifest = self.manifest.read().expect("lock is poisoned");
+
+        // Process level by level with prefix batching
+        for level in manifest.current_version().iter_levels() {
+            if context.is_complete() {
+                break;
+            }
+
+            for run in level.iter() {
+                if context.is_complete() {
+                    break;
+                }
+
+                // Process each prefix batch against this run
+                for prefix_batch in &prefix_batches {
+                    if prefix_batch.keys.is_empty() {
+                        continue;
+                    }
+
+                    // Create segment batches for this prefix batch
+                    let segment_batches =
+                        self.create_segment_batches_for_prefix_batch(run, prefix_batch);
+
+                    // Process each segment batch with prefix-aware bloom filtering
+                    for batch in segment_batches {
+                        if let Some(segment) = run.iter().find(|s| s.id() == batch.segment_id) {
+                            self.multiget_from_segment_prefix_aware(
+                                segment,
+                                &batch,
+                                prefix_batch,
+                                context,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(manifest);
+        Ok(())
+    }
+
+    /// Prefix-aware multiget with optimized bloom filter batching
+    fn multiget_from_segments_prefix_optimized(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+        _config: &crate::multiget::MultiGetConfig,
+    ) -> crate::Result<()> {
+        use crate::multiget::PrefixBatchOrganizer;
+
+        // Get prefix extractor from tree config
+        let prefix_extractor = self.config.prefix_extractor.clone();
+
+        // Organize keys by prefix for better bloom filter utilization
+        let mut prefix_organizer = PrefixBatchOrganizer::new(prefix_extractor);
+        prefix_organizer.add_keys(context.remaining_keys.clone());
+        let prefix_batches = prefix_organizer.into_batches();
+
+        let manifest = self.manifest.read().expect("lock is poisoned");
+
+        // Process level by level with prefix-aware batching
+        for level in manifest.current_version().iter_levels() {
+            if context.is_complete() {
+                break;
+            }
+
+            for run in level.iter() {
+                if context.is_complete() {
+                    break;
+                }
+
+                // Process each prefix batch against this run
+                for prefix_batch in &prefix_batches {
+                    if prefix_batch.keys.is_empty() {
+                        continue;
+                    }
+
+                    // Create segment batches for this prefix batch
+                    let segment_batches =
+                        self.create_segment_batches_for_prefix_batch(run, prefix_batch);
+
+                    // Process each segment batch with prefix-aware bloom filtering
+                    for batch in segment_batches {
+                        if let Some(segment) = run.iter().find(|s| s.id() == batch.segment_id) {
+                            self.multiget_from_segment_prefix_aware(
+                                segment,
+                                &batch,
+                                prefix_batch,
+                                context,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(manifest);
+        Ok(())
+    }
+
+    /// Create batches of keys grouped by which segments they might be in
+    fn create_segment_batches(
+        &self,
+        run: &crate::version::Run<crate::segment::Segment>,
+        remaining_keys: &[crate::multiget::KeyWithIndex],
+    ) -> Vec<crate::multiget::SegmentBatch> {
+        use std::collections::HashMap;
+
+        let mut batches: HashMap<u64, Vec<crate::multiget::KeyWithIndex>> = HashMap::new();
+
+        for key_with_index in remaining_keys {
+            // Find which segment(s) this key might be in
+            if run.len() >= 4 {
+                // Use binary search for larger runs
+                if let Some(segment) = run.get_for_key(&key_with_index.key) {
+                    batches
+                        .entry(segment.id())
+                        .or_default()
+                        .push(key_with_index.clone());
+                }
+            } else {
+                // Linear search for smaller runs
+                for segment in run.iter() {
+                    if segment.is_key_in_key_range(&key_with_index.key) {
+                        batches
+                            .entry(segment.id())
+                            .or_default()
+                            .push(key_with_index.clone());
+                    }
+                }
+            }
+        }
+
+        // Convert to SegmentBatch structs with pre-computed hashes
+        batches
+            .into_iter()
+            .map(|(segment_id, keys)| {
+                let key_hashes = keys
+                    .iter()
+                    .map(|k| crate::segment::filter::standard_bloom::Builder::get_hash(&k.key))
+                    .collect();
+
+                crate::multiget::SegmentBatch {
+                    segment_id,
+                    keys,
+                    key_hashes,
+                }
+            })
+            .collect()
+    }
+
+    /// Create segment batches for a specific prefix batch
+    fn create_segment_batches_for_prefix_batch(
+        &self,
+        run: &crate::version::Run<crate::segment::Segment>,
+        prefix_batch: &crate::multiget::PrefixBatch,
+    ) -> Vec<crate::multiget::SegmentBatch> {
+        use std::collections::HashMap;
+
+        let mut batches: HashMap<u64, Vec<crate::multiget::KeyWithIndex>> = HashMap::new();
+
+        for key_with_index in &prefix_batch.keys {
+            // Find which segment(s) this key might be in
+            if run.len() >= 4 {
+                // Use binary search for larger runs
+                if let Some(segment) = run.get_for_key(&key_with_index.key) {
+                    // Check if segment might contain this prefix batch
+                    if let Ok(might_contain) = crate::multiget::prefix_batching::PrefixBatchOrganizer::segment_might_contain_prefix(segment, prefix_batch) {
+                        if might_contain {
+                            batches.entry(segment.id()).or_default().push(key_with_index.clone());
+                        }
+                    }
+                }
+            } else {
+                // Linear search for smaller runs
+                for segment in run.iter() {
+                    if segment.is_key_in_key_range(&key_with_index.key) {
+                        if let Ok(might_contain) = crate::multiget::prefix_batching::PrefixBatchOrganizer::segment_might_contain_prefix(segment, prefix_batch) {
+                            if might_contain {
+                                batches.entry(segment.id()).or_default().push(key_with_index.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Convert to SegmentBatch structs with pre-computed hashes
+        batches
+            .into_iter()
+            .map(|(segment_id, keys)| {
+                let key_hashes = keys
+                    .iter()
+                    .map(|k| crate::segment::filter::standard_bloom::Builder::get_hash(&k.key))
+                    .collect();
+
+                crate::multiget::SegmentBatch {
+                    segment_id,
+                    keys,
+                    key_hashes,
+                }
+            })
+            .collect()
+    }
+
+    /// Process a batch of keys from a single segment with bloom filter optimization
+    fn multiget_from_segment(
+        &self,
+        segment: &crate::segment::Segment,
+        batch: &crate::multiget::SegmentBatch,
+        context: &mut crate::multiget::MultiGetContext,
+    ) -> crate::Result<()> {
+        // Batch bloom filter check - this is the key optimization
+        let bloom_results = self.batch_bloom_filter_check(segment, batch)?;
+
+        // Only process keys that passed the bloom filter
+        for (i, key_with_index) in batch.keys.iter().enumerate() {
+            if !bloom_results[i] {
+                continue; // Bloom filter says key is definitely not present
+            }
+
+            // Do the actual segment lookup
+            let key_hash = batch.key_hashes[i];
+            if let Some(item) = segment.get(&key_with_index.key, context.request.seqno, key_hash)? {
+                if let Some(item) = ignore_tombstone_value(item) {
+                    context.mark_found(key_with_index.index, item.value);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a batch of keys from a single segment with prefix-aware optimizations
+    fn multiget_from_segment_prefix_aware(
+        &self,
+        segment: &crate::segment::Segment,
+        batch: &crate::multiget::SegmentBatch,
+        prefix_batch: &crate::multiget::PrefixBatch,
+        context: &mut crate::multiget::MultiGetContext,
+    ) -> crate::Result<()> {
+        // Use prefix bloom filter if available, otherwise fall back to hash-based
+        let bloom_results = if let Some(ref _extractor) = segment.prefix_extractor {
+            if segment.prefix_extractor_compatible {
+                // Use prefix-based bloom filter check
+                self.batch_prefix_bloom_filter_check(segment, prefix_batch)?
+            } else {
+                // Fall back to hash-based bloom filter check
+                self.batch_bloom_filter_check(segment, batch)?
+            }
+        } else {
+            // Fall back to hash-based bloom filter check
+            self.batch_bloom_filter_check(segment, batch)?
+        };
+
+        // Only process keys that passed the bloom filter
+        for (i, key_with_index) in batch.keys.iter().enumerate() {
+            if i >= bloom_results.len() || !bloom_results[i] {
+                continue; // Bloom filter says key is definitely not present
+            }
+
+            // Do the actual segment lookup
+            let key_hash = batch.key_hashes[i];
+            if let Some(item) = segment.get(&key_with_index.key, context.request.seqno, key_hash)? {
+                if let Some(item) = ignore_tombstone_value(item) {
+                    context.mark_found(key_with_index.index, item.value);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batch bloom filter check - pipeline cache misses for better performance
+    fn batch_bloom_filter_check(
+        &self,
+        segment: &crate::segment::Segment,
+        batch: &crate::multiget::SegmentBatch,
+    ) -> crate::Result<Vec<bool>> {
+        use crate::segment::filter::standard_bloom::StandardBloomFilterReader;
+
+        // Early return if no bloom filter
+        if let Some(block) = &segment.pinned_filter_block {
+            let filter = StandardBloomFilterReader::new(&block.data)?;
+            let results: Vec<bool> = batch
+                .key_hashes
+                .iter()
+                .map(|&hash| filter.contains_hash(hash))
+                .collect();
+            Ok(results)
+        } else if let Some(filter_block_handle) = &segment.regions.filter {
+            let block = crate::segment::util::load_block(
+                segment.global_id(),
+                &segment.path,
+                &segment.descriptor_table,
+                &segment.cache,
+                filter_block_handle,
+                crate::segment::block::BlockType::Filter,
+                crate::CompressionType::None,
+                #[cfg(feature = "metrics")]
+                &segment.metrics,
+            )?;
+            let filter = StandardBloomFilterReader::new(&block.data)?;
+            let results: Vec<bool> = batch
+                .key_hashes
+                .iter()
+                .map(|&hash| filter.contains_hash(hash))
+                .collect();
+            Ok(results)
+        } else {
+            // No bloom filter - all keys might be present
+            Ok(vec![true; batch.keys.len()])
+        }
+    }
+
+    /// Batch prefix bloom filter check for enhanced performance
+    fn batch_prefix_bloom_filter_check(
+        &self,
+        segment: &crate::segment::Segment,
+        prefix_batch: &crate::multiget::PrefixBatch,
+    ) -> crate::Result<Vec<bool>> {
+        // Check if the entire prefix batch might be present
+        let might_contain =
+            crate::multiget::prefix_batching::PrefixBatchOrganizer::segment_might_contain_prefix(
+                segment,
+                prefix_batch,
+            )?;
+
+        if might_contain {
+            // All keys in the batch might be present
+            Ok(vec![true; prefix_batch.keys.len()])
+        } else {
+            // No keys in the batch are present
+            Ok(vec![false; prefix_batch.keys.len()])
+        }
+    }
+
+    /// Fallback implementation for when multiget_advanced feature is not available
+    #[cfg(not(feature = "multiget_advanced"))]
+    fn multiget_from_segments_async(
+        &self,
+        context: &mut crate::multiget::MultiGetContext,
+        config: &crate::multiget::MultiGetConfig,
+    ) -> crate::Result<()> {
+        // Fall back to prefix-optimized or standard multiget
+        if self.config.prefix_extractor.is_some() {
+            self.multiget_from_segments_prefix_optimized(context, config)
+        } else {
+            self.multiget_from_segments(context, config)
+        }
     }
 
     #[doc(hidden)]

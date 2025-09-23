@@ -15,20 +15,17 @@ use crate::{
     segment::Segment,
     tree::inner::MemtableId,
     value::InternalValue,
-    vlog::{Accessor, BlobFile, BlobFileId, BlobFileWriter, ValueHandle, ValueLog},
+    vlog::{Accessor, BlobFile, BlobFileId, BlobFileWriter, ValueHandle},
     Config, Memtable, SegmentId, SeqNo, SequenceNumberCounter, UserKey, UserValue,
 };
-use gc::{reader::GcReader, writer::GcWriter};
+// use gc::{reader::GcReader, writer::GcWriter};
 use index::IndexTree;
 use std::{
     collections::BTreeMap,
     io::Cursor,
-    ops::{RangeBounds, RangeFull},
+    ops::RangeBounds,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize},
-        Arc,
-    },
+    sync::{atomic::AtomicUsize, Arc},
 };
 use value::MaybeInlineValue;
 
@@ -235,8 +232,8 @@ impl BlobTree {
         seqno: SeqNo,
         gc_watermark: SeqNo,
     ) -> crate::Result<crate::gc::Report> {
-        use std::io::Error as IoError;
-        use MaybeInlineValue::{Indirect, Inline};
+        // use std::io::Error as IoError;
+        // use MaybeInlineValue::{Indirect, Inline};
 
         todo!()
 
@@ -842,11 +839,33 @@ impl AbstractTree for BlobTree {
         }
     }
 
+    fn multiget(
+        &self,
+        request: crate::multiget::MultiGetRequest,
+        config: Option<crate::multiget::MultiGetConfig>,
+    ) -> crate::Result<crate::multiget::MultiGetResponse> {
+        // Use enhanced blob tree multiget with value log batching
+        let optimizer = crate::multiget::BlobTreeMultiget::new(self);
+        optimizer.execute(request, config)
+    }
+
     fn remove<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> (u64, u64) {
         self.index.remove(key, seqno)
     }
 
     fn remove_weak<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> (u64, u64) {
         self.index.remove_weak(key, seqno)
+    }
+}
+
+impl BlobTree {
+    /// Returns the path to the blob tree folder on disk
+    pub fn path(&self) -> &std::path::Path {
+        &self.index.config.path
+    }
+
+    /// Returns the path to the blobs folder on disk
+    pub fn blobs_folder(&self) -> &std::path::Path {
+        &self.blobs_folder
     }
 }

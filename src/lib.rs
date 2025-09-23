@@ -174,6 +174,9 @@ pub(crate) mod metrics;
 
 mod multi_reader;
 
+/// High-performance batch key lookup operations
+pub mod multiget;
+
 #[doc(hidden)]
 pub mod mvcc_stream;
 
