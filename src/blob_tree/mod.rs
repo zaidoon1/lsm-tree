@@ -25,9 +25,16 @@ use crate::{
 use handle::BlobIndirection;
 use std::{io::Cursor, ops::RangeBounds, path::PathBuf, sync::Arc};
 
-pub struct Guard {
-    tree: crate::BlobTree,
+struct BlobIterContext {
+    tree_id: TreeId,
+    blobs_folder: Arc<PathBuf>,
+    cache: Arc<Cache>,
+    descriptor_table: Arc<DescriptorTable>,
     version: Version,
+}
+
+pub struct Guard {
+    ctx: Arc<BlobIterContext>,
     kv: crate::Result<InternalValue>,
 }
 
@@ -50,11 +57,11 @@ impl IterGuard for Guard {
 
     fn into_inner(self) -> crate::Result<(UserKey, UserValue)> {
         resolve_value_handle(
-            self.tree.id(),
-            self.tree.blobs_folder.as_path(),
-            &self.tree.index.config.cache,
-            &self.tree.index.config.descriptor_table,
-            &self.version,
+            self.ctx.tree_id,
+            self.ctx.blobs_folder.as_path(),
+            &self.ctx.cache,
+            &self.ctx.descriptor_table,
+            &self.ctx.version,
             self.kv?,
         )
     }
@@ -198,15 +205,20 @@ impl AbstractTree for BlobTree {
 
         let range = prefix_to_range(prefix.as_ref());
         let version = self.index.get_version_for_snapshot(seqno).version;
-        let tree = self.clone();
+        let ctx = Arc::new(BlobIterContext {
+            tree_id: self.id(),
+            blobs_folder: self.blobs_folder.clone(),
+            cache: self.index.config.cache.clone(),
+            descriptor_table: self.index.config.descriptor_table.clone(),
+            version,
+        });
 
         Box::new(
             self.index
                 .create_internal_range(&range, seqno, index)
                 .map(move |kv| {
                     IterGuardImpl::Blob(Guard {
-                        tree: tree.clone(),
-                        version: version.clone(),
+                        ctx: ctx.clone(),
                         kv,
                     })
                 }),
@@ -219,16 +231,21 @@ impl AbstractTree for BlobTree {
         seqno: SeqNo,
         index: Option<Arc<Memtable>>,
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static> {
-        let version = self.index.get_version_for_snapshot(seqno);
-        let tree = self.clone();
+        let version = self.index.get_version_for_snapshot(seqno).version;
+        let ctx = Arc::new(BlobIterContext {
+            tree_id: self.id(),
+            blobs_folder: self.blobs_folder.clone(),
+            cache: self.index.config.cache.clone(),
+            descriptor_table: self.index.config.descriptor_table.clone(),
+            version,
+        });
 
         Box::new(
             self.index
                 .create_internal_range(&range, seqno, index)
                 .map(move |kv| {
                     IterGuardImpl::Blob(Guard {
-                        tree: tree.clone(),
-                        version: version.clone().version,
+                        ctx: ctx.clone(),
                         kv,
                     })
                 }),
