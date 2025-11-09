@@ -24,6 +24,8 @@ use crate::{
 };
 use handle::BlobIndirection;
 use std::{io::Cursor, ops::RangeBounds, path::PathBuf, sync::Arc};
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
 
 pub struct Guard {
     tree: crate::BlobTree,
@@ -43,6 +45,8 @@ impl IterGuard for Guard {
                 &self.tree.index.config.descriptor_table,
                 &self.version,
                 kv,
+                #[cfg(feature = "metrics")]
+                self.tree.index.metrics().as_ref(),
             )
             .map(Some)
         } else {
@@ -74,6 +78,8 @@ impl IterGuard for Guard {
             &self.tree.index.config.descriptor_table,
             &self.version,
             self.kv?,
+            #[cfg(feature = "metrics")]
+            self.tree.index.metrics().as_ref(),
         )
     }
 }
@@ -85,6 +91,7 @@ fn resolve_value_handle(
     descriptor_table: &Arc<DescriptorTable>,
     version: &Version,
     item: InternalValue,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> RangeItem {
     if item.key.value_type.is_indirection() {
         let mut cursor = Cursor::new(item.value);
@@ -98,6 +105,8 @@ fn resolve_value_handle(
             &vptr.vhandle,
             cache,
             descriptor_table,
+            #[cfg(feature = "metrics")]
+            metrics,
         ) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
@@ -681,6 +690,8 @@ impl AbstractTree for BlobTree {
             &self.index.config.descriptor_table,
             &version,
             item,
+            #[cfg(feature = "metrics")]
+            self.index.metrics().as_ref(),
         )?;
 
         Ok(Some(v))

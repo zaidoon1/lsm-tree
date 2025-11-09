@@ -41,6 +41,11 @@ impl DescriptorTable {
     }
 
     #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[must_use]
     pub fn access_for_table(&self, id: &GlobalTableId) -> Option<Arc<File>> {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());
         self.inner.get(&key)

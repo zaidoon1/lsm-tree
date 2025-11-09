@@ -149,4 +149,16 @@ impl Metrics {
     pub fn io_skipped_by_filter(&self) -> usize {
         self.io_skipped_by_filter.load(Relaxed)
     }
+
+    pub fn descriptor_table_hit_rate(&self) -> f64 {
+        let hits = self.table_file_opened_cached.load(Relaxed) as f64;
+        let misses = self.table_file_opened.load(Relaxed) as f64;
+
+        let total = hits + misses;
+        if total == 0.0 {
+            1.0
+        } else {
+            hits / total
+        }
+    }
 }

@@ -8,6 +8,8 @@ use crate::{
     Cache, DescriptorTable, GlobalTableId, TreeId, UserValue,
 };
 use std::{fs::File, path::Path, sync::Arc};
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
 
 pub struct Accessor<'a>(&'a BlobFileList);
 
@@ -24,6 +26,7 @@ impl<'a> Accessor<'a> {
         vhandle: &ValueHandle,
         cache: &Cache,
         descriptor_table: &DescriptorTable,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
     ) -> crate::Result<Option<UserValue>> {
         if let Some(value) = cache.get_blob(tree_id, vhandle) {
             return Ok(Some(value));
@@ -38,12 +41,20 @@ impl<'a> Accessor<'a> {
         let cached_fd = descriptor_table.access_for_blob_file(&bf_id);
         let fd_cache_miss = cached_fd.is_none();
 
+        #[cfg(feature = "metrics")]
+        use std::sync::atomic::Ordering::Relaxed;
+
         let file = if let Some(fd) = cached_fd {
+            #[cfg(feature = "metrics")]
+            metrics.table_file_opened_cached.fetch_add(1, Relaxed);
             fd
         } else {
-            Arc::new(File::open(
+            let f = Arc::new(File::open(
                 base_path.join(vhandle.blob_file_id.to_string()),
-            )?)
+            )?);
+            #[cfg(feature = "metrics")]
+            metrics.table_file_opened.fetch_add(1, Relaxed);
+            f
         };
 
         let value = Reader::new(blob_file, &file).get(key, vhandle)?;
