@@ -7,13 +7,13 @@ use crate::{
     table::{
         block::ParsedItem,
         block_index::{BlockIndexIter, BlockIndexIterImpl},
-        util::load_block,
+        util::{load_block_with_ctx, ReadContext},
         BlockHandle,
     },
     Cache, CompressionType, DescriptorTable, InternalValue, SeqNo, UserKey,
 };
 use self_cell::self_cell;
-use std::{path::PathBuf, sync::Arc};
+use std::{fs::File, path::PathBuf, sync::Arc};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -111,6 +111,11 @@ pub struct Iter {
 
     range: Bounds,
 
+    // Context shared for this iterator so all index and data block loads reuse the
+    // same descriptor for this table. This keeps descriptor-table lookups and
+    // file opens to a minimum in long range scans.
+    ctx: ReadContext,
+
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
 }
@@ -144,6 +149,8 @@ impl Iter {
 
             range: (None, None),
 
+            ctx: ReadContext::default(),
+
             #[cfg(feature = "metrics")]
             metrics,
         }
@@ -172,8 +179,25 @@ impl Iterator for Iter {
 
         if !self.index_initialized {
             // Lazily initialize the index iterator here (not in `new`) so callers can set bounds
-            // before we incur any seek or I/O cost. Bounds exclusivity is enforced at the data-
-            // block level; index seeks only narrow the span of blocks to touch.
+            // before any seek or I/O cost is incurred. Bounds exclusivity is enforced at the
+            // data-block level; index seeks only narrow the span of blocks that need to be
+            // inspected.
+            if self.ctx.fd.is_none() {
+                // Seed the context with a descriptor so both index traversal and data-block
+                // materialization share the same `Arc<File>` for this table during the scan.
+                if let Some(fd) = self.descriptor_table.access_for_table(&self.table_id) {
+                    self.ctx.fd = Some(fd);
+                } else {
+                    let fd = fail_iter!(File::open(&*self.path).map(Arc::new));
+                    self.descriptor_table
+                        .insert_for_table(self.table_id, fd.clone());
+                    self.ctx.fd = Some(fd);
+                }
+            }
+
+            // Pass the descriptor down into the block-index iterator so index-block loads for
+            // this scan can bypass the descriptor cache and reuse the same `Arc<File>`.
+            self.index_iter.set_fd_hint(self.ctx.fd.clone());
             let mut ok = true;
 
             if let Some(bound) = &self.range.0 {
@@ -199,8 +223,8 @@ impl Iterator for Iter {
             self.index_initialized = true;
 
             if !ok {
-                // No block in the index overlaps the requested window, so we clear state and return
-                // EOF without attempting to touch any data blocks.
+                // No block in the index overlaps the requested window, so we clear state and
+                // return EOF without touching any data blocks.
                 self.lo_data_block = None;
                 self.hi_data_block = None;
                 return None;
@@ -209,7 +233,7 @@ impl Iterator for Iter {
 
         loop {
             let Some(handle) = self.index_iter.next() else {
-                // No more block handles coming from the index.  Flush any pending items buffered on
+                // No more block handles coming from the index. Flush any pending items buffered on
                 // the high side (used by reverse iteration) before signalling completion.
                 if let Some(block) = &mut self.hi_data_block {
                     if let Some(item) = block.next().map(Ok) {
@@ -224,13 +248,14 @@ impl Iterator for Iter {
             };
             let handle = fail_iter!(handle);
 
-            // Load the next data block referenced by the index handle.  We try the shared block
-            // cache first to avoid hitting the filesystem, and fall back to `load_block` on miss.
+            // Load the next data block referenced by the index handle. Use the shared block
+            // cache when possible to avoid hitting the filesystem, and on a miss go through the
+            // ctx-aware loader so the underlying descriptor stays shared with index-block loads.
             #[expect(clippy::single_match_else)]
             let block = match self.cache.get_block(self.table_id, handle.offset()) {
                 Some(block) => block,
                 None => {
-                    fail_iter!(load_block(
+                    fail_iter!(load_block_with_ctx(
                         self.table_id,
                         &self.path,
                         &self.descriptor_table,
@@ -240,6 +265,7 @@ impl Iterator for Iter {
                         self.compression,
                         #[cfg(feature = "metrics")]
                         &self.metrics,
+                        &mut self.ctx,
                     ))
                 }
             };
@@ -248,8 +274,8 @@ impl Iterator for Iter {
             let mut reader = create_data_block_reader(block);
 
             // Forward path: seek the low side first to avoid returning entries below the lower
-            // bound, then clamp the iterator on the high side. This guarantees iteration stays in
-            // [low, high] with exact control over inclusivity/exclusivity.
+            // bound, then clamp the iterator on the high side. This keeps iteration inside
+            // [low, high] with precise control over inclusivity/exclusivity.
             if let Some(bound) = &self.range.0 {
                 reader.seek_lower_bound(bound, SeqNo::MAX);
             }
@@ -263,8 +289,8 @@ impl Iterator for Iter {
             self.lo_data_block = Some(reader);
 
             if let Some(item) = item {
-                // Serving the first item immediately avoids stashing it in a temporary buffer and
-                // keeps block iteration semantics identical to the simple case at the top.
+                // Serve the first item immediately to match the simple path at the top and avoid
+                // stashing it in an extra buffer.
                 return Some(Ok(item));
             }
         }
@@ -283,8 +309,22 @@ impl DoubleEndedIterator for Iter {
 
         if !self.index_initialized {
             // Mirror forward iteration: initialize lazily so bounds can be applied up-front. The
-            // index only restricts which blocks we consider; tight bound enforcement happens in
-            // the data block readers below.
+            // index only restricts which blocks are considered; strict bound handling still
+            // happens inside the data-block readers.
+            if self.ctx.fd.is_none() {
+                // Establish the shared descriptor exactly once so both index traversal and
+                // backward data-block reads reuse the same `Arc<File>`.
+                if let Some(fd) = self.descriptor_table.access_for_table(&self.table_id) {
+                    self.ctx.fd = Some(fd);
+                } else {
+                    let fd = fail_iter!(File::open(&*self.path).map(Arc::new));
+                    self.descriptor_table
+                        .insert_for_table(self.table_id, fd.clone());
+                    self.ctx.fd = Some(fd);
+                }
+            }
+
+            self.index_iter.set_fd_hint(self.ctx.fd.clone());
             let mut ok = true;
 
             if let Some(bound) = &self.range.0 {
@@ -306,7 +346,8 @@ impl DoubleEndedIterator for Iter {
             self.index_initialized = true;
 
             if !ok {
-                // No index span overlaps the requested window; clear both buffers and finish early.
+                // No index span overlaps the requested window; clear both buffers and finish
+                // early without touching any data blocks.
                 self.lo_data_block = None;
                 self.hi_data_block = None;
                 return None;
@@ -315,8 +356,8 @@ impl DoubleEndedIterator for Iter {
 
         loop {
             let Some(handle) = self.index_iter.next_back() else {
-                // Once we exhaust the index in reverse order, flush any items that were buffered on
-                // the low side (set when iterating forward first) before signalling completion.
+                // Once the index is exhausted in reverse order, flush any items that are buffered
+                // on the low side (for callers that walked forward first) before completing.
                 if let Some(block) = &mut self.lo_data_block {
                     if let Some(item) = block.next_back().map(Ok) {
                         return Some(item);
@@ -330,12 +371,13 @@ impl DoubleEndedIterator for Iter {
             };
             let handle = fail_iter!(handle);
 
-            // Retrieve the next data block from the cache (or disk on miss) so the high-side reader
-            // can serve entries in reverse order.
+            // Retrieve the next data block from the cache (or disk on miss) so the high-side
+            // reader can serve entries in reverse order. Use the ctx-aware loader on cache miss
+            // so reverse scans share the same table descriptor as forward scans.
             let block = match self.cache.get_block(self.table_id, handle.offset()) {
                 Some(block) => block,
                 None => {
-                    fail_iter!(load_block(
+                    fail_iter!(load_block_with_ctx(
                         self.table_id,
                         &self.path,
                         &self.descriptor_table,
@@ -345,6 +387,7 @@ impl DoubleEndedIterator for Iter {
                         self.compression,
                         #[cfg(feature = "metrics")]
                         &self.metrics,
+                        &mut self.ctx,
                     ))
                 }
             };
@@ -352,9 +395,6 @@ impl DoubleEndedIterator for Iter {
 
             let mut reader = create_data_block_reader(block);
 
-            // Reverse path: clamp the high side first so `next_back` never yields an entry above
-            // the upper bound, then apply the low-side seek to avoid stepping below the lower
-            // bound during reverse traversal.
             if let Some(bound) = &self.range.1 {
                 reader.seek_upper_bound(bound, SeqNo::MAX);
             }
@@ -368,8 +408,6 @@ impl DoubleEndedIterator for Iter {
             self.hi_data_block = Some(reader);
 
             if let Some(item) = item {
-                // Emit the first materialized entry immediately to match the forward path and avoid
-                // storing it in a temporary buffer.
                 return Some(Ok(item));
             }
         }

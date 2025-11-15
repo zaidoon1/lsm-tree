@@ -7,7 +7,7 @@ use crate::{
     table::{
         block::BlockType,
         block_index::{iter::OwnedIndexBlockIter, BlockIndexIter},
-        util::load_block,
+        util::load_block_with_fd_hint,
     },
     Cache, CompressionType, DescriptorTable, GlobalTableId, UserKey,
 };
@@ -45,6 +45,7 @@ impl TwoLevelBlockIndex {
             descriptor_table: self.descriptor_table.clone(),
             cache: self.cache.clone(),
             compression: self.compression,
+            fd_hint: None,
 
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
@@ -67,6 +68,11 @@ pub struct Iter {
     descriptor_table: Arc<DescriptorTable>,
     cache: Arc<Cache>,
     compression: CompressionType,
+
+    // Optional descriptor shared with the table-level read path. When present,
+    // index-block loads can use it directly instead of consulting the descriptor
+    // cache or opening a new file.
+    fd_hint: Option<Arc<std::fs::File>>,
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
@@ -103,6 +109,10 @@ impl BlockIndexIter for Iter {
         self.hi = Some(key.into());
         true
     }
+
+    fn set_fd_hint(&mut self, fd: Option<Arc<std::fs::File>>) {
+        self.fd_hint = fd;
+    }
 }
 
 impl Iterator for Iter {
@@ -123,7 +133,7 @@ impl Iterator for Iter {
             let next_lowest_block = tli.next();
 
             if let Some(handle) = next_lowest_block {
-                let block = fail_iter!(load_block(
+                let block = fail_iter!(load_block_with_fd_hint(
                     self.table_id,
                     &self.path,
                     &self.descriptor_table,
@@ -133,6 +143,7 @@ impl Iterator for Iter {
                     self.compression,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
+                    self.fd_hint.as_ref(),
                 ));
                 let index_block = IndexBlock::new(block);
 
@@ -186,7 +197,7 @@ impl DoubleEndedIterator for Iter {
             let next_highest_block = tli.next_back();
 
             if let Some(handle) = next_highest_block {
-                let block = fail_iter!(load_block(
+                let block = fail_iter!(load_block_with_fd_hint(
                     self.table_id,
                     &self.path,
                     &self.descriptor_table,
@@ -196,6 +207,7 @@ impl DoubleEndedIterator for Iter {
                     self.compression,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
+                    self.fd_hint.as_ref(),
                 ));
                 let index_block = IndexBlock::new(block);
 

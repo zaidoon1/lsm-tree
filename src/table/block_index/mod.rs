@@ -12,6 +12,8 @@ pub use two_level::TwoLevelBlockIndex;
 pub use volatile::VolatileBlockIndex;
 
 use super::KeyedBlockHandle;
+use std::fs::File;
+use std::sync::Arc;
 
 pub trait BlockIndex {
     fn forward_reader(&self, needle: &[u8]) -> Option<BlockIndexIterImpl>;
@@ -21,6 +23,14 @@ pub trait BlockIndex {
 pub trait BlockIndexIter: DoubleEndedIterator<Item = crate::Result<KeyedBlockHandle>> {
     fn seek_lower(&mut self, key: &[u8]) -> bool;
     fn seek_upper(&mut self, key: &[u8]) -> bool;
+
+    /// Receives an optional `Arc<File>` that can be reused for index-block reads.
+    ///
+    /// Implementations that never perform on-demand I/O (for example a fully
+    /// materialized index) can ignore this hint, while volatile or two-level
+    /// indexes can reuse the descriptor instead of consulting the descriptor
+    /// cache for each index-block access.
+    fn set_fd_hint(&mut self, _fd: Option<Arc<File>>) {}
 }
 
 pub enum BlockIndexIterImpl {
@@ -43,6 +53,19 @@ impl BlockIndexIter for BlockIndexIterImpl {
             Self::Full(i) => i.seek_upper(key),
             Self::Volatile(i) => i.seek_upper(key),
             Self::TwoLevel(i) => i.seek_upper(key),
+        }
+    }
+
+    fn set_fd_hint(&mut self, fd: Option<Arc<File>>) {
+        match self {
+            // A full index keeps all metadata in memory and never needs to touch disk for
+            // index lookups, so the descriptor hint is irrelevant here.
+            Self::Full(_i) => drop(fd),
+            // Volatile and two-level indexes may need to materialize index blocks from disk
+            // on demand; passing the hint down lets them reuse the same descriptor that the
+            // table-level read path already opened.
+            Self::Volatile(i) => i.set_fd_hint(fd),
+            Self::TwoLevel(i) => i.set_fd_hint(fd),
         }
     }
 }

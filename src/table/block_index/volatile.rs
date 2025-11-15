@@ -7,7 +7,7 @@ use crate::{
     table::{
         block::BlockType,
         block_index::{iter::OwnedIndexBlockIter, BlockIndexIter},
-        util::load_block,
+        util::load_block_with_fd_hint,
         BlockHandle, IndexBlock,
     },
     Cache, CompressionType, DescriptorTable, GlobalTableId, UserKey,
@@ -56,6 +56,8 @@ pub struct Iter {
     lo: Option<UserKey>,
     hi: Option<UserKey>,
 
+    fd_hint: Option<Arc<std::fs::File>>,
+
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Arc<Metrics>,
 }
@@ -74,6 +76,8 @@ impl Iter {
             lo: None,
             hi: None,
 
+            fd_hint: None,
+
             #[cfg(feature = "metrics")]
             metrics: index.metrics.clone(),
         }
@@ -90,6 +94,10 @@ impl BlockIndexIter for Iter {
         self.hi = Some(key.into());
         true
     }
+
+    fn set_fd_hint(&mut self, fd: Option<Arc<std::fs::File>>) {
+        self.fd_hint = fd;
+    }
 }
 
 impl Iterator for Iter {
@@ -99,7 +107,7 @@ impl Iterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next().map(Ok)
         } else {
-            let block = fail_iter!(load_block(
+            let block = fail_iter!(load_block_with_fd_hint(
                 self.table_id,
                 &self.path,
                 &self.descriptor_table,
@@ -109,6 +117,7 @@ impl Iterator for Iter {
                 self.compression,
                 #[cfg(feature = "metrics")]
                 &self.metrics,
+                self.fd_hint.as_ref(),
             ));
             let index_block = IndexBlock::new(block);
 
@@ -139,7 +148,7 @@ impl DoubleEndedIterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next_back().map(Ok)
         } else {
-            let block = fail_iter!(load_block(
+            let block = fail_iter!(load_block_with_fd_hint(
                 self.table_id,
                 &self.path,
                 &self.descriptor_table,
@@ -149,6 +158,7 @@ impl DoubleEndedIterator for Iter {
                 self.compression,
                 #[cfg(feature = "metrics")]
                 &self.metrics,
+                self.fd_hint.as_ref(),
             ));
             let index_block = IndexBlock::new(block);
 

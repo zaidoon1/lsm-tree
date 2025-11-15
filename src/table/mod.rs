@@ -39,7 +39,7 @@ use crate::{
     },
     Checksum, CompressionType, InternalValue, SeqNo, TreeId, UserKey,
 };
-use block_index::BlockIndexImpl;
+use block_index::{BlockIndexImpl, BlockIndexIter};
 use inner::Inner;
 use iter::Iter;
 use std::{
@@ -50,7 +50,6 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use util::load_block;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -183,13 +182,17 @@ impl Table {
         self.metadata.id
     }
 
-    fn load_block(
+    // Load a block from this table using a shared read context so all block reads for a single
+    // logical operation (filter/index/data) reuse one descriptor. This minimizes descriptor-table
+    // lookups and avoids redundant opens while preserving block-cache semantics and metrics.
+    fn load_block_with_ctx(
         &self,
         handle: &BlockHandle,
         block_type: BlockType,
         compression: CompressionType,
+        ctx: &mut util::ReadContext,
     ) -> crate::Result<Block> {
-        load_block(
+        util::load_block_with_ctx(
             self.global_id(),
             &self.path,
             &self.descriptor_table,
@@ -199,16 +202,8 @@ impl Table {
             compression,
             #[cfg(feature = "metrics")]
             &self.metrics,
+            ctx,
         )
-    }
-
-    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
-        self.load_block(
-            handle,
-            BlockType::Data,
-            self.metadata.data_block_compression,
-        )
-        .map(DataBlock::new)
     }
 
     /// Returns the (possibly compressed) file size.
@@ -229,6 +224,10 @@ impl Table {
             return Ok(None);
         }
 
+        let mut ctx = util::ReadContext::default();
+
+        // Reuse a single FD across the entire get() flow: filter -> index -> data.
+        // A context is created per lookup and seeded lazily on first disk access.
         let filter_block = if let Some(block) = &self.pinned_filter_block {
             Some(Cow::Borrowed(block))
         } else if let Some(filter_idx) = &self.pinned_filter_index {
@@ -238,10 +237,12 @@ impl Table {
             if let Some(filter_block_handle) = iter.next() {
                 let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
 
-                let block = self.load_block(
+                // Filter block lives in the same file; reuse the same FD via ctx.
+                let block = self.load_block_with_ctx(
                     &filter_block_handle.into_inner(),
                     BlockType::Filter,
                     CompressionType::None, // NOTE: We never write a filter block with compression
+                    &mut ctx,
                 )?;
                 let block = FilterBlock::new(block);
 
@@ -252,10 +253,12 @@ impl Table {
         } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
             unimplemented!("unpinned filter TLI not supported");
         } else if let Some(filter_block_handle) = &self.regions.filter {
-            let block = self.load_block(
+            // Unpinned single filter block path; still reuse the table FD.
+            let block = self.load_block_with_ctx(
                 filter_block_handle,
                 BlockType::Filter,
                 CompressionType::None, // NOTE: We never write a filter block with compression
+                &mut ctx,
             )?;
             let block = FilterBlock::new(block);
 
@@ -276,22 +279,42 @@ impl Table {
             }
         }
 
-        self.point_read(key, seqno)
+        self.point_read_with_ctx(key, seqno, &mut ctx)
     }
 
     // TODO: maybe we can skip Fuse costs of the user key
     // TODO: because we just want to return the value
     // TODO: we would need to return something like ValueType + Value
     // TODO: so the caller can decide whether to return the value or not
-    fn point_read(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
-        let Some(iter) = self.block_index.forward_reader(key) else {
+    // Lookup that continues from the index into data blocks while reusing the same FD.
+    fn point_read_with_ctx(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        ctx: &mut util::ReadContext,
+    ) -> crate::Result<Option<InternalValue>> {
+        if ctx.fd.is_none() {
+            if let Some(fd) = self.descriptor_table.access_for_table(&self.global_id()) {
+                ctx.fd = Some(fd);
+            } else {
+                let fd = Arc::new(File::open(&*self.path)?);
+                self.descriptor_table
+                    .insert_for_table(self.global_id(), fd.clone());
+                ctx.fd = Some(fd);
+            }
+        }
+
+        let Some(mut iter) = self.block_index.forward_reader(key) else {
             return Ok(None);
         };
+
+        // Pass a stable FD to the index reader so it can avoid descriptor cache probes as well.
+        iter.set_fd_hint(ctx.fd.clone());
 
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let block = self.load_data_block(block_handle.as_ref())?;
+            let block = self.load_data_block_with_ctx(block_handle.as_ref(), ctx)?;
 
             if let Some(item) = block.point_read(key, seqno) {
                 return Ok(Some(item));
@@ -305,6 +328,21 @@ impl Table {
         }
 
         Ok(None)
+    }
+
+    // Data block loads also go through the ctx-aware path to keep a single FD per lookup.
+    fn load_data_block_with_ctx(
+        &self,
+        handle: &BlockHandle,
+        ctx: &mut util::ReadContext,
+    ) -> crate::Result<DataBlock> {
+        self.load_block_with_ctx(
+            handle,
+            BlockType::Data,
+            self.metadata.data_block_compression,
+            ctx,
+        )
+        .map(DataBlock::new)
     }
 
     /// Creates a scanner over the `Table`.

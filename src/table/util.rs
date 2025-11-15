@@ -23,11 +23,22 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
-/// Loads a block from disk or block cache, if cached.
+/// Shared state for a single logical read against one table.
 ///
-/// Also handles file descriptor opening and caching.
+/// Carries an opened descriptor that is reused across multiple block loads in a
+/// point lookup or range iteration. This avoids repeated descriptor-table
+/// lookups and redundant `File::open` calls while still going through the
+/// standard block cache and metrics accounting.
+#[derive(Default)]
+pub struct ReadContext {
+    pub(crate) fd: Option<Arc<std::fs::File>>,
+}
+
+// Uses the descriptor stored in `ctx` when available so filter/index/data blocks for a
+// single table share one `Arc<File>`. Falls back to the descriptor cache, and only
+// opens the underlying file when both context and cache miss.
 #[warn(clippy::too_many_arguments)]
-pub fn load_block(
+pub fn load_block_with_ctx(
     table_id: GlobalTableId,
     path: &Path,
     descriptor_table: &DescriptorTable,
@@ -36,11 +47,12 @@ pub fn load_block(
     block_type: BlockType,
     compression: CompressionType,
     #[cfg(feature = "metrics")] metrics: &Metrics,
+    ctx: &mut ReadContext,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
     use std::sync::atomic::Ordering::Relaxed;
 
-    log::trace!("load {block_type:?} block {handle:?}");
+    log::trace!("load {block_type:?} block {handle:?} (ctx)");
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
         #[cfg(feature = "metrics")]
@@ -55,25 +67,121 @@ pub fn load_block(
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
             _ => {}
-        }
-
+        };
         return Ok(block);
     }
 
-    let cached_fd = descriptor_table.access_for_table(&table_id);
-    let fd_cache_miss = cached_fd.is_none();
+    // Prefer a descriptor already held by the current read path; otherwise consult the
+    // descriptor cache. On a full miss, open the file once and keep it both in the
+    // context and the descriptor cache so later block loads for this table can reuse it.
+    let mut fd_cache_miss = false;
 
-    let fd = if let Some(fd) = cached_fd {
+    let fd = if let Some(fd) = &ctx.fd {
+        fd.clone()
+    } else if let Some(fd) = descriptor_table.access_for_table(&table_id) {
         #[cfg(feature = "metrics")]
         metrics.table_file_opened_cached.fetch_add(1, Relaxed);
-
+        ctx.fd = Some(fd.clone());
         fd
     } else {
         let fd = std::fs::File::open(path)?;
-
         #[cfg(feature = "metrics")]
         metrics.table_file_opened.fetch_add(1, Relaxed);
+        let fd = Arc::new(fd);
+        ctx.fd = Some(fd.clone());
+        fd_cache_miss = true;
+        fd
+    };
 
+    let block = Block::from_file(&fd, *handle, compression)?;
+
+    if block.header.block_type != block_type {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
+
+    #[cfg(feature = "metrics")]
+    match block_type {
+        BlockType::Filter => {
+            metrics.filter_block_load_io.fetch_add(1, Relaxed);
+        }
+        BlockType::Index => {
+            metrics.index_block_load_io.fetch_add(1, Relaxed);
+        }
+        BlockType::Data => {
+            metrics.data_block_load_io.fetch_add(1, Relaxed);
+        }
+        _ => {}
+    };
+
+    if fd_cache_miss {
+        descriptor_table.insert_for_table(table_id, fd);
+    }
+
+    cache.insert_block(table_id, handle.offset(), block.clone());
+    Ok(block)
+}
+
+// Accepts an optional `fd_hint` provided by higher-level iterators.
+//
+// When the hint is present, the descriptor cache is bypassed and the hint is used
+// directly. This is useful for index-only paths that do not build a full
+// `ReadContext`, but still want to reuse a descriptor that has already been opened
+// by the caller. If the hint is absent, the function behaves like the legacy
+// helper: consult the descriptor cache and open the file on a miss.
+#[warn(clippy::too_many_arguments)]
+pub fn load_block_with_fd_hint(
+    table_id: GlobalTableId,
+    path: &Path,
+    descriptor_table: &DescriptorTable,
+    cache: &Cache,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+    fd_hint: Option<&Arc<std::fs::File>>,
+) -> crate::Result<Block> {
+    #[cfg(feature = "metrics")]
+    use std::sync::atomic::Ordering::Relaxed;
+
+    log::trace!("load {block_type:?} block {handle:?} (fd_hint)");
+
+    if let Some(block) = cache.get_block(table_id, handle.offset()) {
+        #[cfg(feature = "metrics")]
+        match block_type {
+            BlockType::Filter => {
+                metrics.filter_block_load_cached.fetch_add(1, Relaxed);
+            }
+            BlockType::Index => {
+                metrics.index_block_load_cached.fetch_add(1, Relaxed);
+            }
+            BlockType::Data => {
+                metrics.data_block_load_cached.fetch_add(1, Relaxed);
+            }
+            _ => {}
+        };
+        return Ok(block);
+    }
+
+    let cached_fd = if fd_hint.is_some() {
+        None
+    } else {
+        descriptor_table.access_for_table(&table_id)
+    };
+    let fd_cache_miss = cached_fd.is_none() && fd_hint.is_none();
+
+    let fd: Arc<std::fs::File> = if let Some(fd) = fd_hint.cloned() {
+        fd
+    } else if let Some(fd) = cached_fd {
+        #[cfg(feature = "metrics")]
+        metrics.table_file_opened_cached.fetch_add(1, Relaxed);
+        fd
+    } else {
+        let fd = std::fs::File::open(path)?;
+        #[cfg(feature = "metrics")]
+        metrics.table_file_opened.fetch_add(1, Relaxed);
         Arc::new(fd)
     };
 
@@ -98,15 +206,13 @@ pub fn load_block(
             metrics.data_block_load_io.fetch_add(1, Relaxed);
         }
         _ => {}
-    }
+    };
 
-    // Cache FD
     if fd_cache_miss {
         descriptor_table.insert_for_table(table_id, fd);
     }
 
     cache.insert_block(table_id, handle.offset(), block.clone());
-
     Ok(block)
 }
 

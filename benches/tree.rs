@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use lsm_tree::{AbstractTree, BlockCache, Config};
+use lsm_tree::{AbstractTree, BlockCache, Config, SequenceNumberCounter};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -11,7 +11,7 @@ fn full_scan(c: &mut Criterion) {
         group.bench_function(format!("scan all uncached, {item_count} items"), |b| {
             let path = tempdir().unwrap();
 
-            let tree = Config::new(path)
+            let tree = Config::new(path, SequenceNumberCounter::default())
                 .block_cache(BlockCache::with_capacity_bytes(0).into())
                 .open()
                 .unwrap();
@@ -32,7 +32,7 @@ fn full_scan(c: &mut Criterion) {
         group.bench_function(format!("scan all cached, {item_count} items"), |b| {
             let path = tempdir().unwrap();
 
-            let tree = Config::new(path)
+            let tree = Config::new(path, SequenceNumberCounter::default())
                 .block_cache(BlockCache::with_capacity_bytes(100_000_000).into())
                 .open()
                 .unwrap();
@@ -61,7 +61,7 @@ fn scan_vs_query(c: &mut Criterion) {
     for size in [100_000, 1_000_000] {
         let path = tempdir().unwrap();
 
-        let tree = Config::new(path)
+        let tree = Config::new(path, SequenceNumberCounter::default())
             .block_cache(BlockCache::with_capacity_bytes(0).into())
             .open()
             .unwrap();
@@ -131,7 +131,7 @@ fn scan_vs_prefix(c: &mut Criterion) {
     for size in [10_000, 100_000, 1_000_000] {
         let path = tempdir().unwrap();
 
-        let tree = Config::new(path)
+        let tree = Config::new(path, SequenceNumberCounter::default())
             .block_cache(BlockCache::with_capacity_bytes(0).into())
             .open()
             .unwrap();
@@ -186,7 +186,7 @@ fn tree_get_pairs(c: &mut Criterion) {
     for segment_count in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
         {
             let folder = tempfile::tempdir().unwrap();
-            let tree = Config::new(folder)
+            let tree = Config::new(folder, SequenceNumberCounter::default())
                 .data_block_size(1_024)
                 .block_cache(Arc::new(BlockCache::with_capacity_bytes(0)))
                 .open()
@@ -267,7 +267,7 @@ fn tree_get_pairs(c: &mut Criterion) {
 fn disk_point_read(c: &mut Criterion) {
     let folder = tempdir().unwrap();
 
-    let tree = Config::new(folder)
+    let tree = Config::new(folder, SequenceNumberCounter::default())
         .data_block_size(1_024)
         .block_cache(Arc::new(BlockCache::with_capacity_bytes(0)))
         .open()
@@ -300,12 +300,78 @@ fn disk_point_read(c: &mut Criterion) {
     });
 }
 
+fn cached_point_read(c: &mut Criterion) {
+    let folder = tempdir().unwrap();
+
+    let tree = Config::new(folder)
+        .data_block_size(1_024)
+        .block_cache(Arc::new(BlockCache::with_capacity_bytes(100_000_000)))
+        .open()
+        .unwrap();
+
+    for seqno in 0..10 {
+        tree.insert("a", "b", seqno);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    // Warm cache and descriptor path.
+    tree.get("a", None).unwrap().unwrap();
+
+    c.bench_function("point read latest (cached)", |b| {
+        let tree = tree.clone();
+
+        b.iter(|| {
+            tree.get("a", None).unwrap().unwrap();
+        });
+    });
+}
+
+fn cached_small_range(c: &mut Criterion) {
+    use std::ops::Bound::*;
+
+    let folder = tempdir().unwrap();
+
+    let tree = Config::new(folder)
+        .data_block_size(1_024)
+        .block_cache(Arc::new(BlockCache::with_capacity_bytes(100_000_000)))
+        .open()
+        .unwrap();
+
+    for x in 0_u64..100_000 {
+        let key = x.to_be_bytes();
+        tree.insert(key, key, 0);
+    }
+    tree.flush_active_memtable(0).unwrap();
+
+    let lo = Included(60_000_u64.to_be_bytes().to_vec());
+    let hi = Excluded(60_010_u64.to_be_bytes().to_vec());
+
+    // Warm cache and descriptor path.
+    assert_eq!(
+        10,
+        tree.range((lo.clone(), hi.clone()), None, None)
+            .into_iter()
+            .count()
+    );
+
+    c.bench_function("small range (cached)", |b| {
+        let tree = tree.clone();
+        let lo = lo.clone();
+        let hi = hi.clone();
+
+        b.iter(|| {
+            let iter = tree.range((lo.clone(), hi.clone()), None, None);
+            assert_eq!(iter.into_iter().count(), 10);
+        });
+    });
+}
+
 fn disjoint_tree_minmax(c: &mut Criterion) {
     let mut group = c.benchmark_group("Disjoint tree");
 
     let folder = tempfile::tempdir().unwrap();
 
-    let tree = Config::new(folder)
+    let tree = Config::new(folder, SequenceNumberCounter::default())
         .data_block_size(1_024)
         .block_cache(Arc::new(BlockCache::with_capacity_bytes(0)))
         .open()
@@ -360,7 +426,7 @@ fn disjoint_tree_minmax(c: &mut Criterion) {
 fn blob_tree_get(c: &mut Criterion) {
     let folder = tempfile::tempdir().unwrap();
 
-    let tree = Config::new(folder.path())
+    let tree = Config::new(folder.path(), SequenceNumberCounter::default())
         .block_cache(BlockCache::with_capacity_bytes(0).into())
         .open_as_blob_tree()
         .unwrap();
@@ -382,6 +448,8 @@ fn blob_tree_get(c: &mut Criterion) {
 criterion_group!(
     benches,
     blob_tree_get,
+    cached_point_read,
+    cached_small_range,
     disjoint_tree_minmax,
     disk_point_read,
     full_scan,
